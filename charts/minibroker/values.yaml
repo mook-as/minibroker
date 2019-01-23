@@ -14,3 +14,10 @@ tls:
 serviceCatalogEnabledOnly: true
 
 deployServiceCatalog: false
+
+kube:
+  registry:
+    hostname: index.docker.io
+    username: ""
+    password: ""
+  organization: splatform
