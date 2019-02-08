@@ -9,5 +9,5 @@ metadata:
     release: "{{ .Release.Name }}"
     heritage: "{{ .Release.Service }}"
 spec:
-  url: http://minibroker-minibroker.minibroker.svc.cluster.local
+  url: http://{{ template "fullname" . }}.{{ .Release.Namespace }}.svc.cluster.local
 {{ end }}
