@@ -4,6 +4,7 @@ PKG ?= $(REPO)/cmd/$(BINARY)
 REGISTRY ?= osbkit/
 IMAGE ?= $(REGISTRY)minibroker
 TAG ?= canary
+IMAGE_PULL_POLICY ?= Always
 
 build:
 	go build $(PKG)
@@ -120,7 +121,7 @@ deploy:
 	until svcat version | grep -m 1 'Server Version: v' ; do : ; done
 	helm upgrade --install minibroker --namespace minibroker \
 	--recreate-pods --force charts/minibroker \
-	--set image="$(IMAGE):$(TAG)",imagePullPolicy="Always",deploymentStrategy="Recreate"
+	--set image="$(IMAGE):$(TAG)",imagePullPolicy="$(IMAGE_PULL_POLICY)",deploymentStrategy="Recreate"
 
 release: release-images release-charts
 
