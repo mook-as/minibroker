@@ -12,10 +12,10 @@ import (
 	"github.com/Masterminds/semver"
 	"github.com/davecgh/go-spew/spew"
 	"github.com/golang/glog"
-	"github.com/osbkit/minibroker/pkg/helm"
-	"github.com/osbkit/minibroker/pkg/tiller"
+	minibrokerhelm "github.com/osbkit/minibroker/pkg/helm"
 	"github.com/pkg/errors"
 	osb "github.com/pmorie/go-open-service-broker-client/v2"
+	"gopkg.in/yaml.v2"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -24,6 +24,8 @@ import (
 	"k8s.io/apimachinery/pkg/util/strategicpatch"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
+	"k8s.io/helm/pkg/helm"
+	rls "k8s.io/helm/pkg/proto/hapi/services"
 	"k8s.io/helm/pkg/repo"
 )
 
@@ -59,7 +61,7 @@ const (
 )
 
 type Client struct {
-	helm                      *helm.Client
+	helm                      *minibrokerhelm.Client
 	namespace                 string
 	coreClient                kubernetes.Interface
 	providers                 map[string]Provider
@@ -68,7 +70,7 @@ type Client struct {
 
 func NewClient(repoURL string, serviceCatalogEnabledOnly bool) *Client {
 	return &Client{
-		helm:                      helm.NewClient(repoURL),
+		helm:                      minibrokerhelm.NewClient(repoURL),
 		coreClient:                loadInClusterClient(),
 		namespace:                 loadNamespace(),
 		serviceCatalogEnabledOnly: serviceCatalogEnabledOnly,
@@ -314,6 +316,8 @@ func (c *Client) Provision(instanceID, serviceID, planID, namespace string, acce
 		return "", errors.Wrapf(err, "could not persist the instance configmap for %q", instanceID)
 	}
 
+	glog.Infof("provisioning %s/%s using stable helm chart %s@%s...", serviceID, planID, chartName, chartVersion)
+
 	if acceptsIncomplete {
 		operationKey := generateOperationName(OperationPrefixProvision)
 		err = c.updateConfigMap(instanceID, map[string]interface{}{
@@ -325,13 +329,7 @@ func (c *Client) Provision(instanceID, serviceID, planID, namespace string, acce
 			return "", errors.Wrapf(err, "Failed to set operation key when provisioning instance %s", instanceID)
 		}
 		go func() {
-			err = c.provisionSynchronously(instanceID, namespace, serviceID, planID, chartName, chartVersion, provisionParams)
-			if err == nil {
-				err = c.updateConfigMap(instanceID, map[string]interface{}{
-					OperationStateKey:       string(osb.StateSucceeded),
-					OperationDescriptionKey: fmt.Sprintf("service instance %q provisioned", instanceID),
-				})
-			} else {
+			fail := func(err error) {
 				glog.Errorf("Failed to provision %q: %s", instanceID, err)
 				err = c.updateConfigMap(instanceID, map[string]interface{}{
 					OperationStateKey:       string(osb.StateFailed),
@@ -341,11 +339,38 @@ func (c *Client) Provision(instanceID, serviceID, planID, namespace string, acce
 					glog.Errorf("Could not update operation state when provisioning asynchronously: %s", err)
 				}
 			}
+
+			resp, err := c.installRelease(chartName, chartVersion, namespace, provisionParams, helm.InstallWait(true))
+			if err != nil {
+				fail(err)
+				return
+			}
+
+			err = c.updateProvisioningState(resp.Release.Name, instanceID, resp.Release.Namespace, provisionParams)
+			if err != nil {
+				fail(err)
+				return
+			}
+
+			glog.Infof("provision of %v@%v (%v@%v) complete\n%s\n",
+				chartName, chartVersion, resp.Release.Name, resp.Release.Version, spew.Sdump(resp.Release.Manifest))
+			err = c.updateConfigMap(instanceID, map[string]interface{}{
+				OperationStateKey:       string(osb.StateSucceeded),
+				OperationDescriptionKey: fmt.Sprintf("service instance %q provisioned", instanceID),
+			})
+			if err != nil {
+				glog.Errorf("Could not update operation state when provisioning asynchronously: %s", err)
+			}
 		}()
 		return operationKey, nil
 	}
 
-	err = c.provisionSynchronously(instanceID, namespace, serviceID, planID, chartName, chartVersion, provisionParams)
+	resp, err := c.installRelease(chartName, chartVersion, namespace, provisionParams)
+	if err != nil {
+		return "", err
+	}
+
+	err = c.updateProvisioningState(resp.Release.Name, instanceID, resp.Release.Namespace, provisionParams)
 	if err != nil {
 		return "", err
 	}
@@ -353,37 +378,54 @@ func (c *Client) Provision(instanceID, serviceID, planID, namespace string, acce
 	return "", nil
 }
 
-// provisionSynchronously will provision the service instance synchronously.
-func (c *Client) provisionSynchronously(instanceID, namespace, serviceID, planID, chartName, chartVersion string, provisionParams map[string]interface{}) error {
-	glog.Infof("provisioning %s/%s using stable helm chart %s@%s...", serviceID, planID, chartName, chartVersion)
-
+func (c *Client) installRelease(
+	chartName string,
+	chartVersion string,
+	namespace string,
+	provisionParams map[string]interface{},
+	opts ...helm.InstallOption,
+) (*rls.InstallReleaseResponse, error) {
 	chartDef, err := c.helm.GetChart(chartName, chartVersion)
 	if err != nil {
-		return err
+		return nil, err
 	}
 
-	tc, close, err := c.connectTiller()
+	tc, err := c.connectTiller()
 	if err != nil {
-		return err
+		return nil, err
 	}
-	defer close()
 
-	chart, err := helm.LoadChart(chartDef)
+	chart, err := minibrokerhelm.LoadChart(chartDef)
 	if err != nil {
-		return err
+		return nil, err
 	}
 
-	resp, err := tc.Create(chart, namespace, provisionParams)
+	valuesYaml, err := yaml.Marshal(provisionParams)
 	if err != nil {
-		return err
+		return nil, err
 	}
+	allOpts := []helm.InstallOption{
+		helm.ValueOverrides(valuesYaml),
+		helm.InstallReuseName(true),
+		helm.InstallDisableHooks(true),
+	}
+	allOpts = append(allOpts, opts...)
+	glog.Infof("Installing release %s on namespace %s...", chart, namespace)
+	return tc.InstallReleaseFromChart(chart, namespace, allOpts...)
+}
 
+func (c *Client) updateProvisioningState(
+	releaseName string,
+	instanceID string,
+	namespace string,
+	provisionParams map[string]interface{},
+) error {
 	// Store any required metadata necessary for bind and deprovision as labels on the resources itself
 	glog.Infof("Labeling chart resources with instance %q...", instanceID)
 	filterByRelease := metav1.ListOptions{
 		LabelSelector: labels.SelectorFromSet(map[string]string{
 			HeritageLabel: TillerHeritage,
-			ReleaseLabel:  resp.Release.Name,
+			ReleaseLabel:  releaseName,
 		}).String(),
 	}
 	services, err := c.coreClient.CoreV1().Services(namespace).List(filterByRelease)
@@ -408,15 +450,12 @@ func (c *Client) provisionSynchronously(instanceID, namespace, serviceID, planID
 	}
 
 	err = c.updateConfigMap(instanceID, map[string]interface{}{
-		ReleaseLabel:        resp.Release.Name,
-		ReleaseNamespaceKey: resp.Release.Namespace,
+		ReleaseLabel:        releaseName,
+		ReleaseNamespaceKey: namespace,
 	})
 	if err != nil {
 		return errors.Wrapf(err, "could not update the instance configmap for %q", instanceID)
 	}
-
-	glog.Infof("provision of %v@%v (%v@%v) complete\n%s\n",
-		chartName, chartVersion, resp.Release.Name, resp.Release.Version, spew.Sdump(resp.Release.Manifest))
 
 	return nil
 }
@@ -471,23 +510,19 @@ func (c *Client) labelSecret(secret corev1.Secret, instanceID string) error {
 	return nil
 }
 
-func (c *Client) connectTiller() (*tiller.Client, func(), error) {
-	config := tiller.Config{
-		Host: "localhost",
-		Port: 44134,
-	}
-	tc, err := config.NewClient()
+func (c *Client) connectTiller() (*helm.Client, error) {
+	glog.Infof("Connecting to tiller at localhost...")
+
+	tc := helm.NewClient(helm.Host("localhost:44134"))
+
+	err := tc.PingTiller()
 	if err != nil {
-		return nil, nil, err
-	}
-	close := func() {
-		err := tc.Close()
-		if err != nil {
-			glog.Errorln(errors.Wrapf(err, "failed to disconnect tiller client"))
-		}
+		return nil, err
 	}
 
-	return tc, close, nil
+	glog.Infoln("Connected!")
+
+	return tc, nil
 }
 
 func (c *Client) Bind(instanceID, serviceID string, bindParams map[string]interface{}) (map[string]interface{}, error) {
@@ -610,25 +645,30 @@ func (c *Client) Deprovision(instanceID string, acceptsIncomplete bool) (string,
 }
 
 func (c *Client) deprovisionSynchronously(instanceID, release string) error {
-	tc, close, err := c.connectTiller()
+	tc, err := c.connectTiller()
 	if err != nil {
 		return err
 	}
-	defer close()
 
-	_, err = tc.Delete(release)
+	glog.Infof("Deleting release %s", release)
+
+	opts := []helm.DeleteOption{
+		helm.DeleteDisableHooks(false),
+		helm.DeletePurge(true),
+	}
+	_, err = tc.DeleteRelease(release, opts...)
 	if err != nil {
 		return errors.Wrapf(err, "could not delete release %s", release)
 	}
 
-	glog.Infof("release %s deleted", release)
+	glog.Infof("Release %s deleted", release)
 
 	err = c.coreClient.CoreV1().ConfigMaps(c.namespace).Delete(instanceID, &metav1.DeleteOptions{})
 	if err != nil {
 		return errors.Wrapf(err, "could not delete configmap %s/%s", c.namespace, instanceID)
 	}
 
-	glog.Infof("deprovision of %q is complete", instanceID)
+	glog.Infof("Deprovision of %q is complete", instanceID)
 	return nil
 }
 
