@@ -31,7 +31,7 @@ import (
 	"github.com/kubernetes-sigs/minibroker/pkg/nameutil"
 )
 
-//go:generate mockgen -destination=./mocks/mock_chart.go -package=mocks github.com/kubernetes-sigs/minibroker/pkg/helm ChartLoader,ChartHelmClientProvider,HelmClientInstallRunner,HelmClientUninstallRunner
+//go:generate mockgen -destination=./mocks/mock_chart.go -package=mocks github.com/kubernetes-sigs/minibroker/pkg/helm ChartLoader,ChartHelmClientProvider
 //go:generate mockgen -destination=./mocks/mock_io.go -package=mocks io ReadCloser
 
 // ChartInstaller is the interface that wraps the Install method.
@@ -131,7 +131,7 @@ func (cc *ChartClient) Install(
 		return nil, fmt.Errorf("failed to install chart: %v", err)
 	}
 
-	rls, err := installer.Run(chartRequested, values)
+	rls, err := installer(chartRequested, values)
 	if err != nil {
 		return nil, fmt.Errorf("failed to install chart: %v", err)
 	}
@@ -146,7 +146,7 @@ func (cc *ChartClient) Uninstall(releaseName, namespace string) error {
 		return fmt.Errorf("failed to uninstall chart: %v", err)
 	}
 
-	if _, err := uninstaller.Run(releaseName); err != nil {
+	if _, err := uninstaller(releaseName); err != nil {
 		return fmt.Errorf("failed to uninstall chart: %v", err)
 	}
 
@@ -217,7 +217,7 @@ type ChartHelm struct {
 // NewDefaultChartHelm creates a new ChartHelm with the default dependencies.
 func NewDefaultChartHelm() *ChartHelm {
 	return NewChartHelm(
-		NewDefaultConfig(),
+		NewDefaultConfigProvider(),
 		action.NewInstall,
 		action.NewUninstall,
 	)
@@ -241,35 +241,31 @@ func (ch *ChartHelm) ProvideInstaller(
 	releaseName string,
 	namespace string,
 ) (HelmClientInstallRunner, error) {
-	cfg, err := ch.configProvider.Provide(namespace)
+	cfg, err := ch.configProvider(namespace)
 	if err != nil {
 		return nil, fmt.Errorf("failed to provide chart installer: %v", err)
 	}
-	client := ch.actionNewInstall(cfg.(*action.Configuration))
+	client := ch.actionNewInstall(cfg)
 	client.ReleaseName = releaseName
 	client.Namespace = namespace
 	client.Wait = true
-	return client, nil
+	return client.Run, nil
 }
 
 // ProvideUninstaller provides a Helm action client for uninstalling charts.
 func (ch *ChartHelm) ProvideUninstaller(namespace string) (HelmClientUninstallRunner, error) {
-	cfg, err := ch.configProvider.Provide(namespace)
+	cfg, err := ch.configProvider(namespace)
 	if err != nil {
 		return nil, fmt.Errorf("failed to provide chart uninstaller: %v", err)
 	}
-	client := ch.actionNewUninstall(cfg.(*action.Configuration))
-	return client, nil
+	client := ch.actionNewUninstall(cfg)
+	return client.Run, nil
 }
 
 // HelmClientInstallRunner is the interface that wraps the Run method that matches the upstream
 // Helm action install client.
-type HelmClientInstallRunner interface {
-	Run(*chart.Chart, map[string]interface{}) (*release.Release, error)
-}
+type HelmClientInstallRunner func(*chart.Chart, map[string]interface{}) (*release.Release, error)
 
 // HelmClientUninstallRunner is the interface that wraps the Run method that matches the upstream
 // Helm action uninstall client.
-type HelmClientUninstallRunner interface {
-	Run(string) (*release.UninstallReleaseResponse, error)
-}
+type HelmClientUninstallRunner func(string) (*release.UninstallReleaseResponse, error)

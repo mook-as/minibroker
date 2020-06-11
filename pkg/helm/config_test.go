@@ -18,6 +18,7 @@ package helm_test
 
 import (
 	"fmt"
+	"reflect"
 
 	. "github.com/onsi/ginkgo"
 	. "github.com/onsi/gomega"
@@ -25,92 +26,76 @@ import (
 
 	"helm.sh/helm/v3/pkg/action"
 
-	"github.com/golang/mock/gomock"
 	"github.com/kubernetes-sigs/minibroker/pkg/helm"
-	"github.com/kubernetes-sigs/minibroker/pkg/helm/mocks"
 	"github.com/kubernetes-sigs/minibroker/pkg/log"
 )
 
 var _ = Describe("Config", func() {
 	Describe("Config", func() {
-		Describe("NewDefaultConfig", func() {
+		Describe("NewDefaultConfigProvider", func() {
 			It("should satisfy the ConfigProvider interface", func() {
-				var config helm.ConfigProvider = helm.NewDefaultConfig()
+				var config helm.ConfigProvider = helm.NewDefaultConfigProvider()
 				Expect(config).NotTo(BeNil())
 			})
 		})
 
-		Describe("Provide", func() {
-			var ctrl *gomock.Controller
-
-			BeforeEach(func() {
-				ctrl = gomock.NewController(GinkgoT())
-			})
-
-			AfterEach(func() {
-				ctrl.Finish()
-			})
-
+		Describe("ConfigProviderProvider", func() {
 			It("should fail when actionConfig.Init fails", func() {
-				actionConfig := mocks.NewMockConfigInitializer(ctrl)
-				actionConfig.EXPECT().
-					Init(gomock.Any(), "my-namespace", gomock.Any(), gomock.Any()).
-					Return(fmt.Errorf("some error")).
-					Times(1)
-				configInitializerProvider := mocks.NewMockConfigInitializerProvider(ctrl)
-				configInitializerProvider.EXPECT().
-					Provide().
-					Return(actionConfig).
-					Times(1)
-				config := helm.NewConfig(log.NewNoop(), configInitializerProvider, "", "")
-				cfg, err := config.Provide("my-namespace")
+				actionConfig := &action.Configuration{}
+				configInitializerProvider := func() (*action.Configuration, helm.ConfigInitializer) {
+					initializer := func(genericclioptions.RESTClientGetter, string, string, action.DebugLog) error {
+						return fmt.Errorf("some error")
+					}
+					return actionConfig, initializer
+				}
+
+				configProvider := helm.ConfigProviderProvider(
+					log.NewNoop(),
+					configInitializerProvider,
+					"",
+					"",
+				)
+				cfg, err := configProvider("my-namespace")
 				Expect(err).To(Equal(fmt.Errorf("failed to provide action configuration: some error")))
 				Expect(cfg).To(BeNil())
 			})
 
 			It("should succeed", func() {
-				actionConfig := mocks.NewMockConfigInitializer(ctrl)
-				actionConfig.EXPECT().
-					Init(gomock.Any(), "my-namespace", gomock.Any(), gomock.Any()).
-					Do(func(
-						_ genericclioptions.RESTClientGetter,
-						_ string,
-						_ string,
-						log action.DebugLog,
-					) error {
-						log("whatever")
-						return nil
-					}).
-					Return(nil).
-					Times(1)
-				configInitializerProvider := mocks.NewMockConfigInitializerProvider(ctrl)
-				configInitializerProvider.EXPECT().
-					Provide().
-					Return(actionConfig).
-					Times(1)
-				config := helm.NewConfig(log.NewNoop(), configInitializerProvider, "", "")
-				cfg, err := config.Provide("my-namespace")
+				actionConfig := &action.Configuration{}
+				initCount := 0
+				initializer := func(
+					_ genericclioptions.RESTClientGetter,
+					_ string,
+					_ string,
+					log action.DebugLog,
+				) error {
+					log("whatever")
+					initCount += 1
+					return nil
+				}
+				configInitializerProvider := func() (*action.Configuration, helm.ConfigInitializer) {
+					return actionConfig, initializer
+				}
+
+				configProvider := helm.ConfigProviderProvider(
+					log.NewNoop(),
+					configInitializerProvider,
+					"",
+					"",
+				)
+				cfg, err := configProvider("my-namespace")
 				Expect(err).NotTo(HaveOccurred())
 				Expect(cfg).To(Equal(actionConfig))
+				Expect(initCount).To(Equal(1))
 			})
 		})
 	})
 
-	Describe("ConfigInitializerProvider", func() {
-		Describe("NewDefaultConfigInitializerProvider", func() {
-			It("should create a ConfigInitializerProvider", func() {
-				configInitializerProvider := helm.NewDefaultConfigInitializerProvider()
-				Expect(configInitializerProvider).NotTo(BeNil())
-			})
-		})
-
-		Describe("Provide", func() {
-			It("should provide a new pointer instance of action.Configuration", func() {
-				configInitializerProvider := helm.NewDefaultConfigInitializerProvider()
-				actionConfig := configInitializerProvider.Provide()
-				Expect(actionConfig).NotTo(BeNil())
-				Expect(*(actionConfig.(*action.Configuration))).To(Equal(action.Configuration{}))
-			})
+	Describe("DefaultConfigInitializerProvider", func() {
+		It("should return action.Configuration.Init", func() {
+			config, initializer := helm.DefaultConfigInitializerProvider()
+			Expect(reflect.ValueOf(initializer).Pointer()).
+				To(Equal(reflect.ValueOf(config.Init).Pointer()))
 		})
 	})
 })
